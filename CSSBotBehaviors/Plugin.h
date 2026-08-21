@@ -3,7 +3,7 @@
 
 #include "ISmmPlugin.h"
 
-#define PLUGIN_VERSION	"1.0"
+#define PLUGIN_VERSION	"1.6.3"
 
 PLUGIN_GLOBALVARS();
 

@@ -1,6 +1,7 @@
 #include "BotPath.h"
 #include "BotHiding.h"
 #include "SigScans.h"
+#include "calltemplates.h"
 #include "edict.h"
 #include "eiface.h"
 #include "convar.h"
@@ -26,10 +27,14 @@ extern IFileSystem *filesystem;
 
 ConVar g_cvMaxBotBombFetchDistance( "bot_max_bomb_fetch_distance", "1600.0", FCVAR_NONE );
 ConVar g_cvFullPathRandomization( "bot_full_path_randomization", "1", FCVAR_NONE, "Whether danger value should be randomized for every nav area." );
+ConVar g_cvDontUseTeamPaths( "bot_dont_use_team_paths", "0", FCVAR_NONE, "Whether bots should not consider rushing together." );
+ConVar g_cvDontUseDangerAreas( "bot_dont_use_danger_areas", "0", FCVAR_NONE, "Whether bots should not use the map's specified danger areas." );
+ConVar g_cvHideOnHuntChance( "bot_hide_on_hunt_chance", "20", FCVAR_NONE, "The chance that bots hide when they start hunting." );
+ConVar g_cvBotTargetZone( "bot_target_zone", "-1", FCVAR_NONE, "Which bomb/rescue zone should bots go to when hunting (-1 = any, 0 = A, 1 = B, etc.)." );
 ConVar g_cvDangerAreaDebug( "danger_area_debug", "0", FCVAR_CHEAT );
 
-NavAreaList *TheNavAreaList = *reinterpret_cast<NavAreaList **>( 0x221C2B11 );
-CNavMesh *TheNavMesh = **reinterpret_cast<CNavMesh ***>( 0x2233B0DA );
+NavAreaList *TheNavAreaList = NULL;
+CNavMesh *TheNavMesh = NULL;
 
 CUtlVector< DangerArea * > TheDangerAreas;
 
@@ -69,15 +74,7 @@ void BotHunt( CCSBot *pBot )
 	if( pStateAdr == ((char*)pBot + huntStateOffs) )
 		return;
 
-	union
-	{
-		void (FnEmptyClass::*mfpnew)();
-		void* addr;
-	}
-	u;
-	u.addr = CCSBot_Hunt_Sig.Address();
-	
-	(reinterpret_cast<FnEmptyClass*>(pBot)->*u.mfpnew)();
+	CallObjectNonVirtualFunc_0<void>( pBot, CCSBot_Hunt_Sig.Address() );
 }
 
 //=======================================================================================================================
@@ -94,7 +91,7 @@ void DoRoundMoneyCheck( void )
 {
 	g_bHaveDoneRoundMoneyCheck = true;
 
-	if( !TheDangerAreas.Count() )
+	if( !TheDangerAreas.Count() || g_cvDontUseTeamPaths.GetBool() || g_cvDontUseDangerAreas.GetBool() )
 	{
 		g_iTeamSafePathIndex[ 0 ] = -1;
 		g_iTeamSafePathIndex[ 1 ] = -1;
@@ -158,7 +155,7 @@ void DoRoundMoneyCheck( void )
 		if( bHasHelmet )
 			++iNumHaveHelmet[teamID % NUM_TEAMS];
 
-		if( PlayerHasWeaponInSlot( pEnt, SLOT_PRIMARY ) )
+		if( PlayerHasWeaponInSlot( (CCSPlayer*)pEnt, SLOT_PRIMARY ) )
 			++iNumHavePrimary[teamID % NUM_TEAMS];
 	}
 
@@ -284,19 +281,14 @@ void OnBotComputePath( CCSBot *me, const Vector & goal, RouteType route )
 
 	float repathTimestamp = *(float*)((char*)me + 12092); // < This is from the beginning of ComputePath
 
-	if( !(gpGlobals->curtime > repathTimestamp)
-	|| !TheDangerAreas.Count() )
+	if( !(gpGlobals->curtime > repathTimestamp) )
 	{
 		return;
 	}
 
-	const int teamID = GetTeamNumber( me );
-	const float fMaxTeamPathUseTime = 45.f;
-
 	if( route != SAFEST_ROUTE )
 	{
-		if( g_iTeamSafePathIndex[ teamID % NUM_TEAMS ] != -1
-		&& gpGlobals->curtime - g_fRoundStartTimestamp < fMaxTeamPathUseTime )
+		if( ShouldBlockHide( me ) )
 		{
 			BotHunt( me ); // Make the bot hunt so it doesn't start camping
 		}
@@ -309,6 +301,8 @@ void OnBotComputePath( CCSBot *me, const Vector & goal, RouteType route )
 
 	if( (goal - botpos).IsLengthLessThan( minDist ) )
 		return;
+
+	const int teamID = GetTeamNumber( me );
 
 	// Randomize danger a bit for all areas
 	const int dangerValOffs = 68;
@@ -324,6 +318,9 @@ void OnBotComputePath( CCSBot *me, const Vector & goal, RouteType route )
 			*(float*)((char*)area + dangerTimestampOffs + (teamID == TEAM_T ? 0 : 4)) = gpGlobals->curtime;
 		}
 	}
+
+	if( !TheDangerAreas.Count() || g_cvDontUseDangerAreas.GetBool() )
+		return;
 
 	// Throttle how often the path is changed
 	edict_t *pEdict = gameents->BaseEntityToEdict( (CBaseEntity *)me );
@@ -342,6 +339,7 @@ void OnBotComputePath( CCSBot *me, const Vector & goal, RouteType route )
 
 	// Determine the main route to take
 	int safeRouteIdx;
+	const float fMaxTeamPathUseTime = 45.f; // TODO this should be a global, since it's used in ShouldBlockHide, too
 
 	if( g_iTeamSafePathIndex[ teamID % NUM_TEAMS ] != -1
 	&& gpGlobals->curtime - g_fRoundStartTimestamp < fMaxTeamPathUseTime )
@@ -435,24 +433,23 @@ void OnBotComputePath( CCSBot *me, const Vector & goal, RouteType route )
 
 //=======================================================================================================================
 
+bool BotComputePath( CCSBot *bot, const Vector &goal, RouteType route )
+{
+	return CallObjectNonVirtualFunc_2<bool, const Vector &, RouteType>( bot, CCSBot_ComputePath_Sig.Address(), goal, route );
+}
+
+//=======================================================================================================================
+
 bool NoticeLooseBomb( CCSBot *me )
 {
 	const int bombOffs = 6720;
 
 	CBaseHandle *hBomb = (CBaseHandle*)((char*)TheBots + bombOffs);
+	CBaseEntity *pBomb = GetIndexEntity( hBomb->GetEntryIndex() );
 
-	edict_t *pEdict = engine->PEntityOfEntIndex( hBomb->GetEntryIndex() );
-
-	if( !pEdict || !pEdict->GetUnknown() )
+	if( pBomb )
 	{
-		return false;
-	}
-
-	CBaseEntity *pEnt = pEdict->GetUnknown()->GetBaseEntity();
-
-	if( pEnt )
-	{
-		const Vector &vecBombAbsOrigin = GetAbsOrigin( pEnt );
+		const Vector &vecBombAbsOrigin = GetAbsOrigin( pBomb );
 		const Vector &vecBotAbsOrigin = GetAbsOrigin( me );
 
 		vec_t distance = vecBotAbsOrigin.DistTo( vecBombAbsOrigin );
@@ -487,39 +484,144 @@ bool NoticeLooseBomb( CCSBot *me )
 
 CNavArea *GetNearestNavArea( const Vector &pos, bool anyZ/* = false*/, float maxDist/* = 512.f*/, bool checkLOS/* = false*/ )
 {
-	union {
-		CNavArea *(FnEmptyClass::*mfpnew)(const Vector &, bool, float, bool);
-		void* addr;
-	} u;
-	u.addr = CNavMesh_GetNearestNavArea_Sig.Address();
-
-	return (CNavArea*)(reinterpret_cast<FnEmptyClass*>(TheNavMesh)->*u.mfpnew)(pos, anyZ, maxDist, checkLOS);
+	return CallObjectNonVirtualFunc_4<CNavArea *, const Vector &>
+		( TheNavMesh, CNavMesh_GetNearestNavArea_Sig.Address(), pos, anyZ, maxDist, checkLOS );
 }
 
 //=======================================================================================================================
 
 CNavArea *GetNavArea( const Vector &pos, float beneathLimit/* = 120.f*/ )
 {
-	union {
-		CNavArea *(FnEmptyClass::*mfpnew)(const Vector &, float);
-		void* addr;
-	} u;
-	u.addr = CNavMesh_GetNavArea_Sig.Address();
-
-	return (CNavArea*)(reinterpret_cast<FnEmptyClass*>(TheNavMesh)->*u.mfpnew)(pos, beneathLimit);
+	return CallObjectNonVirtualFunc_2<CNavArea*, const Vector &, float>( TheNavMesh, CNavMesh_GetNavArea_Sig.Address(), pos, beneathLimit );
 }
 
 //=======================================================================================================================
 
 void IncreaseDangerNearby( int teamID, float amount, CNavArea *startArea, const Vector &pos, float maxRadius )
 {
-	union {
-		CNavArea *(FnEmptyClass::*mfpnew)(int, float, CNavArea *, const Vector &, float);
-		void* addr;
-	} u;
-	u.addr = CNavMesh_IncreaseDangerNearby_Sig.Address();
+	CallObjectNonVirtualFunc_5<void, int, float, CNavArea *, const Vector &, float>
+		( TheNavMesh, CNavMesh_IncreaseDangerNearby_Sig.Address(), teamID, amount, startArea, pos, maxRadius );
+}
 
-	(reinterpret_cast<FnEmptyClass*>(TheNavMesh)->*u.mfpnew)(teamID, amount, startArea, pos, maxRadius);
+//=======================================================================================================================
+
+int GetZoneCount( void )
+{
+	const int zoneCountOffs = 6700;
+	return *(int*)((char*)TheBots + zoneCountOffs);
+}
+
+//=======================================================================================================================
+
+const Zone *GetZone( int i )
+{
+	const int zonesOffs = 6220;
+	const int nextZoneOffs = 120;
+	char *zones = (char*)TheBots + zonesOffs;
+
+	return (const Zone *)(zones + i * nextZoneOffs);
+}
+
+//=======================================================================================================================
+
+const Zone *GetRandomZone( void )
+{
+	return CallObjectNonVirtualFunc_0<const Zone *>( TheBots, CCSBotManager_GetRandomZone_Sig.Address() );
+}
+
+//=======================================================================================================================
+
+CNavArea *GetRandomAreaInZone( const Zone *zone )
+{
+	return CallObjectNonVirtualFunc_1<CNavArea*>( TheBots, CCSBotManager_GetRandomAreaInZone_Sig.Address(), zone );
+}
+
+//=======================================================================================================================
+
+const Zone *GetTargetZoneForBot( CCSBot *bot )
+{
+	int zoneCount = GetZoneCount();
+
+	if ( zoneCount == 0 )
+	{
+		return NULL;
+	}
+
+	if ( zoneCount == 1 )
+	{
+		return GetZone( 0 );
+	}
+
+	if ( g_cvBotTargetZone.GetInt() > -1 )
+	{
+		// TODO: Maybe this needs some distance check too?
+		return GetZone( g_cvBotTargetZone.GetInt() % zoneCount );
+	}
+
+	CNavArea *startArea = GetBotLastKnownArea( bot );
+
+	if ( !startArea )
+	{
+		int which = RandomInt( 0, zoneCount-1 );
+		return GetZone( which );
+	}
+
+	// This only supports 2 zones at the moment
+	float distances[ 2 ];
+
+	for ( int z = 0; z < 2; ++z )
+	{
+		const Zone *zone = GetZone( z );
+
+		distances[ z ] = std::max( NavAreaTravelDistance( startArea, zone->m_area[0] ), 1.f );
+	}
+	
+	const float fMinDistance = 1500.f;
+	float fRatio;
+	const Zone *closer, *farther;
+
+	if ( distances[ 0 ] < distances[ 1 ] )
+	{
+		if ( distances[ 0 ] < fMinDistance )
+			return GetZone( 1 );
+
+		fRatio = distances[ 0 ] / distances[ 1 ];
+		closer = GetZone( 0 );
+		farther = GetZone( 1 );
+	}
+	else
+	{
+		if ( distances[ 1 ] < fMinDistance )
+			return GetZone( 0 );
+
+		fRatio = distances[ 1 ] / distances[ 0 ];
+		closer = GetZone( 1 );
+		farther = GetZone( 0 );
+	}
+
+	const float fMinRatio = 0.75f;
+
+	if ( fRatio < fMinRatio )
+	{
+		return closer;
+	}
+
+	const float fartherChance = 50.f * (fRatio);
+
+	if ( RandomFloat( 0.f, 100.f ) < fartherChance )
+	{
+		return farther;
+	}
+
+	return closer;
+}
+
+//=======================================================================================================================
+
+float NavAreaTravelDistance( CNavArea *startArea, CNavArea *endArea )
+{
+	typedef float (*func)( CNavArea *, CNavArea * );
+	return ((func)NavAreaTravelDistance_ShortestPathCost_Sig.Address())( startArea, endArea );
 }
 
 //=======================================================================================================================

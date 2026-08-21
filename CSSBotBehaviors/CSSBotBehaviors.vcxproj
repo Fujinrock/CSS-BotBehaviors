@@ -48,7 +48,7 @@
     <ClCompile>
       <WarningLevel>Level3</WarningLevel>
       <Optimization>Disabled</Optimization>
-      <AdditionalIncludeDirectories>$(CSIGSCAN);$(CDETOUR);$(MMSOURCE18)\core-legacy;$(MMSOURCE18)\core-legacy\sourcehook;$(HL2SDK)\public;$(HL2SDK)\public\engine;$(HL2SDK)\public\game\server;$(HL2SDK)\public\tier0;$(HL2SDK)\public\tier1;$(HL2SDK)\public\vstdlib;$(HL2SDK)\public\dlls;$(HL2SDK)\game_shared;$(HL2SDK)\dlls;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(MMSHARED);$(CSIGSCAN);$(CDETOUR);$(MMSOURCE18)\core-legacy;$(MMSOURCE18)\core-legacy\sourcehook;$(HL2SDK)\public;$(HL2SDK)\public\engine;$(HL2SDK)\public\game\server;$(HL2SDK)\public\tier0;$(HL2SDK)\public\tier1;$(HL2SDK)\public\vstdlib;$(HL2SDK)\public\dlls;$(HL2SDK)\game_shared;$(HL2SDK)\dlls;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <IntrinsicFunctions>false</IntrinsicFunctions>
       <MinimalRebuild>false</MinimalRebuild>
       <BasicRuntimeChecks>Default</BasicRuntimeChecks>
@@ -70,7 +70,7 @@
       <Optimization>MaxSpeed</Optimization>
       <FunctionLevelLinking>true</FunctionLevelLinking>
       <IntrinsicFunctions>false</IntrinsicFunctions>
-      <AdditionalIncludeDirectories>$(CSIGSCAN);$(CDETOUR);$(MMSOURCE18)\core-legacy;$(MMSOURCE18)\core-legacy\sourcehook;$(HL2SDK)\public;$(HL2SDK)\public\engine;$(HL2SDK)\public\game\server;$(HL2SDK)\public\tier0;$(HL2SDK)\public\tier1;$(HL2SDK)\public\vstdlib;$(HL2SDK)\public\dlls;$(HL2SDK)\game_shared;$(HL2SDK)\dlls;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(MMSHARED);$(CSIGSCAN);$(CDETOUR);$(MMSOURCE18)\core-legacy;$(MMSOURCE18)\core-legacy\sourcehook;$(HL2SDK)\public;$(HL2SDK)\public\engine;$(HL2SDK)\public\game\server;$(HL2SDK)\public\tier0;$(HL2SDK)\public\tier1;$(HL2SDK)\public\vstdlib;$(HL2SDK)\public\dlls;$(HL2SDK)\game_shared;$(HL2SDK)\dlls;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <MinimalRebuild>false</MinimalRebuild>
       <BasicRuntimeChecks>Default</BasicRuntimeChecks>
       <PreprocessorDefinitions>WIN32;NDEBUG;_WINDOWS;_USRDLL;SOURCE_ENGINE=1;_CRT_SECURE_NO_DEPRECATE;_CRT_NONSTDC_NO_DEPRECATE;NULL=0;CSTRIKE_DLL;%(PreprocessorDefinitions)</PreprocessorDefinitions>
@@ -89,6 +89,7 @@
   <ItemGroup>
     <ClInclude Include="BotAiming.h" />
     <ClInclude Include="BotHiding.h" />
+    <ClInclude Include="BotLoadout.h" />
     <ClInclude Include="BotPath.h" />
     <ClInclude Include="Events.h" />
     <ClInclude Include="Plugin.h" />
@@ -98,6 +99,7 @@
   <ItemGroup>
     <ClCompile Include="BotAiming.cpp" />
     <ClCompile Include="BotHiding.cpp" />
+    <ClCompile Include="BotLoadout.cpp" />
     <ClCompile Include="BotPath.cpp" />
     <ClCompile Include="Detours.cpp" />
     <ClCompile Include="Events.cpp" />

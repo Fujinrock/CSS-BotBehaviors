@@ -1,6 +1,7 @@
 #include "BotHiding.h"
 #include "BotPath.h"
 #include "SigScans.h"
+#include "calltemplates.h"
 #include "util.h"
 #include "edict.h"
 #include "convar.h"
@@ -8,6 +9,7 @@
 #include "playerinfomanager.h"
 #include "filesystem.h"
 #include "ISmmPlugin.h"
+#include "ivdebugoverlay.h"
 
 extern IVEngineServer *engine;
 extern IPlayerInfoManager *playerinfomgr;
@@ -15,6 +17,7 @@ extern CGlobalVars *gpGlobals;
 extern IFileSystem *filesystem;
 extern ISmmAPI *g_SMAPI;
 extern SourceHook::ISourceHook *g_SHPtr;
+extern IVDebugOverlay *debugoverlay;
 
 CUtlVector< HidingSpotLookInfo > TheLookSpots;			///< Spots to look at while bots are hiding
 CUtlVector< HidingSpot * > DisconnectedHidingSpots;		///< Hiding spots whose nav areas have been removed
@@ -22,11 +25,10 @@ CUtlVector< HidingSpot * > DisconnectedHidingSpots;		///< Hiding spots whose nav
 extern const ConVar *g_pCvNavEdit;
 extern const ConVar *g_pCvNavQuicksave;
 
-// Address is m_Head of the list (*0x221C7253) minus sizeof(CUtlMemory<ListElem_t>) which is 12
-HidingSpotList *TheHidingSpotList = (HidingSpotList*)(((char*)(*reinterpret_cast<void**>( 0x221C7253 ))) - 12);
+HidingSpotList *TheHidingSpotList = NULL;
 
 // CNavArea's static variable m_isReset
-bool *g_bNavMeshIsBeingDestroyed = *reinterpret_cast<bool**>( 0x221C7709 );
+bool *g_bNavMeshIsBeingDestroyed = NULL;
 
 #define MAX_NAV_ID_LEN 128
 char g_szNavIdentifier[ MAX_NAV_ID_LEN ] = { '\000' };
@@ -47,42 +49,16 @@ enum
 
 HidingSpot *CreateHidingSpot( void )
 {
-	const int CreateHidingSpotVTOffs = 1;
+	const unsigned int CreateHidingSpotVTIndex = 1;
 
-	void **this_ptr = *(void ***)&TheNavMesh;
-	void **vtable = *(void***)TheNavMesh;
-	void *func = vtable[ CreateHidingSpotVTOffs ];
-	
-	union
-	{
-		HidingSpot *(FnEmptyClass::* mfpnew)();
-		void* addr;
-	}
-	u;
-	u.addr = func;
-
-	return (HidingSpot *)(reinterpret_cast<FnEmptyClass*>(this_ptr)->*u.mfpnew)();
+	return CallObjectVirtualFunc_0<HidingSpot*>( TheNavMesh, CreateHidingSpotVTIndex );
 }
 
 //=======================================================================================================================
 
 void DestroyHidingSpots( void )
 {
-	if( !CNavMesh_DestroyHidingSpots_Sig.IsSet() )
-	{
-		Warning( "CNavMesh::DestroyHidingSpots address not set\n" );
-		return;
-	}
-
-	union
-	{
-		void (FnEmptyClass::*mfpnew)();
-		void* addr;
-	}
-	u;
-	u.addr = CNavMesh_DestroyHidingSpots_Sig.Address();
-
-	(reinterpret_cast<FnEmptyClass*>(TheNavMesh)->*u.mfpnew)();
+	CallObjectNonVirtualFunc_0<void>( TheNavMesh, CNavMesh_DestroyHidingSpots_Sig.Address() );
 }
 
 //=======================================================================================================================
@@ -92,6 +68,18 @@ HidingSpotList &GetNavAreaHidingSpotList( CNavArea *pArea )
 	const int hidingSpotListOffs = 84;
 
 	return *(HidingSpotList*)((char*)pArea + hidingSpotListOffs);
+}
+
+//=======================================================================================================================
+
+const Vector &GetHidingSpotPosition( HidingSpot *spot )
+{
+	if ( !spot )
+		return vec3_origin;
+
+	const int posOffs = 4;
+
+	return *(Vector *)((char*)spot + posOffs);
 }
 
 //=======================================================================================================================
@@ -150,13 +138,14 @@ void OnNavAreaRemoved( CNavArea *area )
 
 //=======================================================================================================================
 
-const char *GetNavFileName( void )
+// Get the full nav file name with the path and the extension. Pass in szFilename to use it instead of the map's name.
+const char *GetFullNavFileName( const char *szFilename = NULL )
 {
 	char gamePath[256];
 	engine->GetGameDir( gamePath, 256 );
 
 	static char filename[256];
-	Q_snprintf( filename, sizeof( filename ), "%s\\maps\\%s.nav", gamePath, STRING( gpGlobals->mapname ) );
+	Q_snprintf( filename, sizeof( filename ), "%s\\maps\\%s.nav", gamePath, (szFilename ? szFilename : STRING( gpGlobals->mapname )) );
 
 	return filename;
 }
@@ -258,7 +247,7 @@ bool PostNavMeshSave( void )
 
 	// Save look-spots at the end of the nav file
 	// Also save an identifier (piece of text supplied by the user)
-	const char *filename = GetNavFileName();
+	const char *filename = GetFullNavFileName();
 
 	if( !filesystem->FileExists( filename ) )
 	{
@@ -322,40 +311,97 @@ bool PostNavMeshSave( void )
 	filesystem->Flush( file );
 	filesystem->Close( file );
 
+	if( g_pCvNavQuicksave && g_pCvNavQuicksave->GetBool() )
+	{
+		PrintCenterMessage( GetListenServerHost(), "REMINDER: set nav_quicksave to 0 for final save" );
+	}
+
 	RETURN_META_VALUE( MRES_HANDLED, result );
 }
 
 //=======================================================================================================================
 
-// Try to load look-spots and the nav identifier from the nav file.
-// Also load the danger areas from their own file.
-NavErrorType PostNavMeshLoad( void )
+static const char *s_pMapName = NULL; // For restoring the map name after loading the nav
+static bool s_bLoadAborted = false;
+
+NavErrorType PreNavMeshLoad( void )
 {
-	g_bDoNavSaveComputations = false;
-
-	NavErrorType result = META_RESULT_ORIG_RET(NavErrorType);
-
-	if( result != NAV_OK )
+	// Automatically being loaded?
+	if( engine->Cmd_Argc() < 2 || stricmp( engine->Cmd_Argv( 0 ), "nav_load" ) )
 	{
-		RETURN_META_VALUE( MRES_IGNORED, result );
+		RETURN_META_VALUE( MRES_IGNORED, NAV_OK );
 	}
 
-	// Load danger areas first in case something goes wrong here later on
-	LoadDangerAreasFromFile();
+	// Check if there are bots in the game that should be kicked first
+	if( BotsOnTheServer() )
+	{
+		Msg( "ERROR: Bots have to be kicked from the server before loading a navigation file.\n" );
+		s_bLoadAborted = true;
+		RETURN_META_VALUE( MRES_SUPERCEDE, NAV_OK ); // OK so that the original error message is not printed
+	}
 
-	const char *filename = GetNavFileName();
+	// This is where the custom nav name is actually stored (without .nav extension)
+	static char szNavMeshName[256] = {'\000'};
+
+	// Store off the original name
+	s_pMapName = STRING( gpGlobals->mapname );
+
+	const char *pNavArg = engine->Cmd_Argv( 1 );
+
+	// Construct the custom nav file name
+
+	// Does the argument name begin with the full map name?
+	if( Q_strstr( pNavArg, s_pMapName ) == pNavArg )
+	{
+		Q_snprintf( szNavMeshName, sizeof(szNavMeshName), "%s", pNavArg );
+	}
+	else
+	{
+		Q_snprintf( szNavMeshName, sizeof(szNavMeshName), "%s_%s", s_pMapName, pNavArg );
+	}
+	
+	// TODO: remove .nav extension if present
+	
+
+	// Check if the file exists in the first place
+	const char *filename = GetFullNavFileName( szNavMeshName );
+
+	if( !filesystem->FileExists( filename ) )
+	{
+		Msg( "ERROR: Navigation file \"%s.nav\" not found.\n", szNavMeshName );
+		s_bLoadAborted = true;
+		RETURN_META_VALUE( MRES_SUPERCEDE, NAV_OK );
+	}
+
+	s_bLoadAborted = false;
+
+	// Replace gpGlobals->mapname with the name of the nav file
+	*(const char**)&gpGlobals->mapname = szNavMeshName;
+
+	// The original function will now try to load the nav mesh from the custom map name
+	// Original map name is restored after loading
+
+	RETURN_META_VALUE( MRES_HANDLED, NAV_OK );
+}
+
+//=======================================================================================================================
+
+// Try to load look-spots and the nav identifier from the nav file
+bool LoadExtraNavData( void )
+{
+	const char *filename = GetFullNavFileName();
 	FileHandle_t file = filesystem->Open( filename, "rb" );
 
 	if( !file )
 	{
-		RETURN_META_VALUE( MRES_IGNORED, result );
+		return false;
 	}
 
 	const int infoSize = 2 * sizeof(uint);
 	if( filesystem->Size( file ) < infoSize )
 	{
 		filesystem->Close( file );
-		RETURN_META_VALUE( MRES_IGNORED, result );
+		return false;
 	}
 
 	// Check the file identifier and data size from the end of the file
@@ -370,7 +416,7 @@ NavErrorType PostNavMeshLoad( void )
 	if( file_id != LS_FILE_IDENTIFIER )
 	{
 		filesystem->Close( file );
-		RETURN_META_VALUE( MRES_IGNORED, result );
+		return false;
 	}
 
 	// Go to the beginning of the extra data and start reading
@@ -383,7 +429,7 @@ NavErrorType PostNavMeshLoad( void )
 	if( version < LS_FILE_LS_PLUS_ID || version > LS_FILE_MAX_VERSION )
 	{
 		filesystem->Close( file );
-		RETURN_META_VALUE( MRES_IGNORED, result );
+		return false;
 	}
 
 	// Read look-spots
@@ -416,7 +462,7 @@ NavErrorType PostNavMeshLoad( void )
 	if( identifierLen < 0 || identifierLen >= MAX_NAV_ID_LEN )
 	{
 		filesystem->Close( file );
-		RETURN_META_VALUE( MRES_IGNORED, result );
+		return false;
 	}
 
 	if( identifierLen > 0 )
@@ -429,6 +475,48 @@ NavErrorType PostNavMeshLoad( void )
 	// Done reading
 	filesystem->Close( file );
 
+	return true;
+}
+
+//=======================================================================================================================
+
+// Do our own stuff after the nav mesh has been loaded
+NavErrorType PostNavMeshLoad( void )
+{
+	// Post-hooks are always called, so we need to check if the loading was aborted
+	if( s_bLoadAborted )
+	{
+		s_bLoadAborted = false;
+		RETURN_META_VALUE( MRES_HANDLED, NAV_OK );
+	}
+
+	// The navigation mesh has been destroyed, so empty these
+	TheLookSpots.Purge();
+	DisconnectedHidingSpots.Purge();
+
+	g_bDoNavSaveComputations = false;
+
+	NavErrorType result = META_RESULT_ORIG_RET(NavErrorType);
+
+	// Load extra nav data before restoring the map name, since it has to match the loaded nav's name
+	if( result == NAV_OK )
+	{
+		LoadExtraNavData();
+	}
+	
+	// Restore the map name before loading danger areas
+	if( s_pMapName )
+	{
+		*(const char**)&gpGlobals->mapname = s_pMapName;
+		s_pMapName = NULL;
+	}
+
+	// Load danger areas (always from original map name)
+	if( result == NAV_OK )
+	{
+		LoadDangerAreasFromFile();
+	}
+
 	RETURN_META_VALUE( MRES_HANDLED, result );
 }
 
@@ -440,9 +528,11 @@ enum PriorityType
 };
 
 #define INHIBIT_LOOK_AROUND	true
+#define FORCE_LOOK true
 
-void BotLookAtSpot( CCSBot *me, const Vector &spot, float duration, PriorityType priority, bool inhibitLookAround = false )
+void BotLookAtSpot( CCSBot *me, const Vector &spot, float duration, PriorityType priority, bool inhibitLookAround = false, bool force = false )
 {
+	const int NOT_LOOKING_AT_SPOT = 0;
 	const int LOOK_TOWARDS_SPOT = 1;
 	const int iInhibitLookAroundTimestampOffs = 12876;
 	const int iLookAtSpotStateOffs = 12880;
@@ -454,7 +544,12 @@ void BotLookAtSpot( CCSBot *me, const Vector &spot, float duration, PriorityType
 	const int iLookAtSpotAttack = 12913;
 	const int iLookAtDesc = 12914;
 
-	// TODO: check priority of current spot
+	int curLookAtSpotState = *(int*)((char*)me + iLookAtSpotStateOffs);
+	PriorityType curPriority = *(PriorityType*)((char*)me + iLookAtSpotPriority);
+
+	// Don't override previous more important look target if we're not forcing
+	if ( !force && curLookAtSpotState != NOT_LOOKING_AT_SPOT && curPriority > priority )
+		return;
 
 	*(int*)((char*)me + iLookAtSpotStateOffs) = LOOK_TOWARDS_SPOT;
 	*(Vector*)((char*)me + iLookAtSpotOffs) = spot;
@@ -480,7 +575,6 @@ HidingSpot *GetNavAreaClosestHidingSpot( CNavArea *pArea, const Vector &vecPosit
 
 	const HidingSpotList &hidingSpots = GetNavAreaHidingSpotList( pArea );
 
-	const int posOffs = 4;
 	HidingSpot *pClosestSpot = NULL;
 
 	// Bot has to be less than 20 units away from the spot
@@ -491,9 +585,9 @@ HidingSpot *GetNavAreaClosestHidingSpot( CNavArea *pArea, const Vector &vecPosit
 	{
 		HidingSpot *spot = hidingSpots[ it ];
 
-		Vector vecSpotOrigin = *(Vector*)((char*)spot + posOffs);
+		const Vector &vecSpotOrigin = GetHidingSpotPosition( spot );
 
-		float dist = (vecSpotOrigin - vecPosition).LengthSqr();
+		const float dist = (vecSpotOrigin - vecPosition).LengthSqr();
 
 		if( dist < fClosestDistance )
 		{
@@ -526,7 +620,6 @@ bool ShouldBlockHide( CCSBot *me )
 	if( g_iTeamSafePathIndex[ teamID % NUM_TEAMS ] != -1
 	&& gpGlobals->curtime - g_fRoundStartTimestamp < fMaxTeamPathUseTime )
 	{
-		BotHunt( me ); // Make the bot hunt so it doesn't start camping
 		return true;
 	}
 
@@ -535,14 +628,32 @@ bool ShouldBlockHide( CCSBot *me )
 
 //=======================================================================================================================
 
-void OnBotReachHidingSpot( CCSBot *me, void *pHideState )
+Vector GetHidingSpotLookTarget( uint spotID )
 {
-	const int lastKnownAreaOffs = 5912;
+	Vector target; // Init to NAN
 
-	CNavArea *pArea = *(CNavArea**)((char*)me + lastKnownAreaOffs);
+	FOR_EACH_VEC( TheLookSpots, it )
+	{
+		if( TheLookSpots[ it ].spotID == spotID )
+		{
+			target = TheLookSpots[ it ].target;
+			break;
+		}
+	}
 
-	if( !pArea )
-		return;
+	return target;
+}
+
+//=======================================================================================================================
+
+bool OnBotReachHidingSpot( CCSBot *me, void *pHideState )
+{
+	const int hidingSpotOffs = 12;
+	const Vector &vecHidingSpot = *(Vector*)((char*)pHideState + hidingSpotOffs);
+	CNavArea *pArea = GetNavArea( vecHidingSpot );
+
+	if ( !pArea )
+		return false;
 
 	const Vector &vecBotOrigin = GetAbsOrigin( me );
 
@@ -553,35 +664,80 @@ void OnBotReachHidingSpot( CCSBot *me, void *pHideState )
 		DBG_CODE(
 			g_SMAPI->ConPrint( "Failed to find bot's hiding spot\n" );
 		);
-		return;
+		return false;
 	}
 
 	uint uClosestSpotID = GetHidingSpotID( pSpot );
-	Vector vecLookSpot; // Init to NAN
-
-	// Find the look-spot for this hiding spot
-	FOR_EACH_VEC( TheLookSpots, it )
-	{
-		if( TheLookSpots[ it ].spotID == uClosestSpotID )
-		{
-			vecLookSpot = TheLookSpots[ it ].target;
-			break;
-		}
-	}
+	Vector vecLookSpot = GetHidingSpotLookTarget( uClosestSpotID );
 
 	if( !vecLookSpot.IsValid() )
-		return;
+		return false;
 
 	// Make the bot look at the spot and inhibit look-around behavior
 	const int durationOffs = 28;
-
 	float duration = *(float*)((char*)pHideState + durationOffs);
 
-	BotLookAtSpot( me, vecLookSpot, duration, PRIORITY_LOW, INHIBIT_LOOK_AROUND );
+	BotLookAtSpot( me, vecLookSpot, duration, PRIORITY_LOW, INHIBIT_LOOK_AROUND, FORCE_LOOK );
 
 	DBG_CODE(
 		g_SMAPI->ConPrintf( "Found angles for hiding spot %d\n", uClosestSpotID );
 	);
+
+	return true;
+}
+
+//=======================================================================================================================
+
+bool CheckBotHidingLookSpot( CCSBot *me, void *pHideState )
+{
+	HidingSpot *pSpot = GetNavAreaClosestHidingSpot( GetBotLastKnownArea( me ), GetAbsOrigin( me ) );
+	uint uClosestSpotID = GetHidingSpotID( pSpot );
+
+	if( !pSpot || uClosestSpotID == INVALID_SPOT_ID )
+		return false;
+
+	Vector vecLookSpot = GetHidingSpotLookTarget( uClosestSpotID );
+
+	if( !vecLookSpot.IsValid() )
+		return false;
+
+	// Probs not necessary because we're not forcing the looking? <- We are now...
+	const int noiseTimestampOffs = 12828;
+	const float noiseTimestamp = *(float*)((char*)me + noiseTimestampOffs);
+	const float recentNoiseTime = 3.f;
+
+	// Don't set the angles if we're looking at the noise location
+	if( gpGlobals->curtime - noiseTimestamp < recentNoiseTime )
+		return true;
+	
+	// Look until we stop hiding
+	const int hideTimerTimestampOffs = 36;
+	const float hideTimerTimestamp = *(float*)((char*)pHideState + hideTimerTimestampOffs);
+
+	const float remainingTime = hideTimerTimestamp - gpGlobals->curtime;
+
+	BotLookAtSpot( me, vecLookSpot, remainingTime, PRIORITY_LOW, INHIBIT_LOOK_AROUND, FORCE_LOOK );
+
+	return true;
+}
+
+//=======================================================================================================================
+
+bool BotIsHiding( CCSBot *bot )
+{
+	const int hideStateOffs = 5680;
+	const int stateOffs = 5872;
+
+	void *pStateAdr = *reinterpret_cast<void**>((char*)bot + stateOffs);
+
+	return pStateAdr == ((char*)bot + hideStateOffs);
+}
+
+//=======================================================================================================================
+
+bool BotTryToHide( CCSBot *bot, CNavArea *searchFromArea, float duration, float hideRange, bool holdPosition, bool useNearest )
+{
+	return CallObjectNonVirtualFunc_5<bool>( bot, CCSBot_TryToHide_Sig.Address(), searchFromArea, duration, hideRange, holdPosition, useNearest );
 }
 
 //=======================================================================================================================
@@ -589,21 +745,7 @@ void OnBotReachHidingSpot( CCSBot *me, void *pHideState )
 // Removes approach areas and spot encounters from all nav areas
 bool StripNavigationAreas( void )
 {
-	if( !CNavMesh_StripNavigationAreas_Sig.IsSet() )
-	{
-		Msg( "CNavMesh::StripNavigationAreas address not found\n" );
-		return false;
-	}
-
-	union
-	{
-		void (FnEmptyClass::*mfpnew)();
-		void* addr;
-	}
-	u;
-	u.addr = CNavMesh_StripNavigationAreas_Sig.Address();
-
-	(reinterpret_cast<FnEmptyClass*>(TheNavMesh)->*u.mfpnew)();
+	CallObjectNonVirtualFunc_0<void>( TheNavMesh, CNavMesh_StripNavigationAreas_Sig.Address() );
 
 	return true;
 }
@@ -815,6 +957,42 @@ bool HandleHidingSpotCmd( edict_t *pEntity )
 
 //=======================================================================================================================
 
+void DrawActiveHidingSpotLookSpot( void )
+{
+	if ( !g_pCvNavEdit->GetBool() )
+		return;
+
+	CCSPlayer *player = GetListenServerHost();
+
+	if ( !player )
+		return;
+
+	const Vector &origin = GetAbsOrigin( player );
+
+	CNavArea *pArea = GetNearestNavArea( origin + Vector( 0.f, 0.f, 36.f ) );
+
+	if ( !pArea )
+		return;
+
+	HidingSpot *spot = GetNavAreaClosestHidingSpot( pArea, origin );
+
+	if ( !spot )
+		return;
+
+	uint id = GetHidingSpotID( spot );
+	Vector target = GetHidingSpotLookTarget( id );
+
+	if ( !target.IsValid() )
+		return;
+
+	const Vector &spotPos = GetHidingSpotPosition( spot );
+
+	debugoverlay->AddLineOverlay( spotPos + Vector( 0, 0, 64 ), target, 90, 50, 220, true, 0.1f );
+	debugoverlay->AddBoxOverlay( target, Vector( -3, -3, -3 ), Vector( 3, 3, 3 ), QAngle( 0, 0, 0 ), 90, 50, 220, 150, 0.1f );
+}
+
+//=======================================================================================================================
+
 // ISSUE (FIXED?) : If you do this, spot encounters will be computed for hiding spots that will not be saved in the .nav file,
 // because deleting/splitting/merging etc. does not delete the hiding spot objects when the nav area that they belong to is deleted.
 // All the spots that are not connected to any areas anymore stay on TheHidingSpotList until the NavMesh is destroyed at the end of the map.
@@ -825,63 +1003,21 @@ bool HandleHidingSpotCmd( edict_t *pEntity )
 // SOLUTION (implemented) : All the hiding spots that do not belong to any nav area can be temporarily removed from the HidingSpotList for the computing, and added back afterwards.
 void ComputeSpotEncounters( CNavArea *pArea )
 {
-	if( !CNavArea_ComputeSpotEncounters_Sig.IsSet() )
-	{
-		Msg( "CNavArea::ComputeSpotEncounters address not found\n" );
-		return;
-	}
-
-	union
-	{
-		void (FnEmptyClass::*mfpnew)();
-		void* addr;
-	}
-	u;
-	u.addr = CNavArea_ComputeSpotEncounters_Sig.Address();
-
-	(reinterpret_cast<FnEmptyClass*>(pArea)->*u.mfpnew)();
+	CallObjectNonVirtualFunc_0<void>( pArea, CNavArea_ComputeSpotEncounters_Sig.Address() );
 }
 
 //=======================================================================================================================
 
 void ComputeApproachAreas( CNavArea *pArea )
 {
-	if( !CNavArea_ComputeApproachAreas_Sig.IsSet() )
-	{
-		Msg( "CNavArea::ComputeApproachAreas address not found\n" );
-		return;
-	}
-
-	union
-	{
-		void (FnEmptyClass::*mfpnew)();
-		void* addr;
-	}
-	u;
-	u.addr = CNavArea_ComputeApproachAreas_Sig.Address();
-
-	(reinterpret_cast<FnEmptyClass*>(pArea)->*u.mfpnew)();
+	CallObjectNonVirtualFunc_0<void>( pArea, CNavArea_ComputeApproachAreas_Sig.Address() );
 }
 
 //=======================================================================================================================
 
 void ComputeEarliestOccupyTime( CNavArea *pArea )
 {
-	if( !CNavArea_ComputeEarliestOccupyTimes_Sig.IsSet() )
-	{
-		Msg( "CNavArea::ComputeEarliestOccupyTimes address not found\n" );
-		return;
-	}
-
-	union
-	{
-		void (FnEmptyClass::*mfpnew)();
-		void* addr;
-	}
-	u;
-	u.addr = CNavArea_ComputeEarliestOccupyTimes_Sig.Address();
-
-	(reinterpret_cast<FnEmptyClass*>(pArea)->*u.mfpnew)();
+	CallObjectNonVirtualFunc_0<void>( pArea, CNavArea_ComputeEarliestOccupyTimes_Sig.Address() );
 }
 
 //=======================================================================================================================

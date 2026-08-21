@@ -32,6 +32,9 @@
     <ClInclude Include="SigScans.h">
       <Filter>Source</Filter>
     </ClInclude>
+    <ClInclude Include="BotLoadout.h">
+      <Filter>Source</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="BotPath.cpp">
@@ -56,6 +59,9 @@
       <Filter>Source</Filter>
     </ClCompile>
     <ClCompile Include="SigScans.cpp">
+      <Filter>Source</Filter>
+    </ClCompile>
+    <ClCompile Include="BotLoadout.cpp">
       <Filter>Source</Filter>
     </ClCompile>
   </ItemGroup>

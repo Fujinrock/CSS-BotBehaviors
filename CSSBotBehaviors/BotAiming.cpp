@@ -1,5 +1,6 @@
 #include "BotAiming.h"
 #include "BotPath.h"
+#include "calltemplates.h"
 #include "util.h"
 #include "SigScans.h"
 #include "sourcehook.h"
@@ -7,7 +8,6 @@
 #include "convar.h"
 #include "basehandle.h"
 #include "eiface.h"
-#include <algorithm>
 
 extern const ConVar *g_pCvBotFlipout;
 
@@ -68,13 +68,7 @@ void DoAimPatch( void )
 
 void UpdateLookAngles( CCSBot *bot )
 {
-	union {
-		void (FnEmptyClass::*mfpnew)(void);
-		void* addr;
-	} u;
-	u.addr = CCSBot_UpdateLookAngles_Sig.Address();
-
-	(void)(reinterpret_cast<FnEmptyClass*>(bot)->*u.mfpnew)();
+	CallObjectNonVirtualFunc_0<void>( bot, CCSBot_UpdateLookAngles_Sig.Address() );
 }
 
 //=======================================================================================================================
@@ -101,16 +95,7 @@ bool IsBotEnemyPartVisible( CCSBot *bot, VisiblePartType part )
 
 const Vector &GetPartPosition( CCSBot *caller, CCSPlayer *targetPlayer, VisiblePartType part )
 {
-	if( !CCSBot_GetPartPosition_Sig.IsSet() )
-		return vec3_origin;
-
-	union {
-		const Vector &(FnEmptyClass::*mfpnew)(CCSPlayer *, VisiblePartType);
-		void* addr;
-	} u;
-	u.addr = CCSBot_GetPartPosition_Sig.Address();
-
-	return (const Vector &)(reinterpret_cast<FnEmptyClass*>(caller)->*u.mfpnew)(targetPlayer, part);
+	return CallObjectNonVirtualFunc_2<const Vector &>( caller, CCSBot_GetPartPosition_Sig.Address(), targetPlayer, part );
 }
 
 //=======================================================================================================================

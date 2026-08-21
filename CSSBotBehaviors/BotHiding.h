@@ -32,11 +32,16 @@ void OnNavAreaRemoved( CNavArea *area );
 
 bool PreNavMeshSave( void );
 bool PostNavMeshSave( void );
+NavErrorType PreNavMeshLoad( void );
 NavErrorType PostNavMeshLoad( void );
 
 bool ShouldBlockHide( CCSBot *me );
-void OnBotReachHidingSpot( CCSBot *me, void *pHideState );
+bool OnBotReachHidingSpot( CCSBot *me, void *pHideState );
+bool CheckBotHidingLookSpot( CCSBot *me, void *pHideState );
+bool BotIsHiding( CCSBot *bot );
+bool BotTryToHide( CCSBot *bot, CNavArea *searchFromArea = NULL, float duration = -1.0f, float hideRange = 750.0f, bool holdPosition = false, bool useNearest = false );
 
 bool HandleHidingSpotCmd( edict_t *pEntity );
+void DrawActiveHidingSpotLookSpot( void );
 
 #endif // _BOT_HIDING_H_
